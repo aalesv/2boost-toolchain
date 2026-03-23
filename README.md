@@ -7,6 +7,7 @@ This repository contains toolcahin needed to build [2Boost](https://github.com/a
 - Cygwin binaries, including python 3.9 and lxml bindings
 - [Binutils](https://www.gnu.org/software/binutils/) version 2.40
 - [GCC](https://gcc.gnu.org/) version 12.3.0
+- [Swiss File Knife](https://sourceforge.net/projects/swissfileknife/)
 
 ### Custom patches applied to Binutils
 
