@@ -1,0 +1,684 @@
+diff -urN gcc-13.1.0.orig/gcc/config/sh/sh.cc gcc-13.1.0/gcc/config/sh/sh.cc
+--- gcc-13.1.0.orig/gcc/config/sh/sh.cc	2023-04-26 10:09:39.000000000 +0300
++++ gcc-13.1.0/gcc/config/sh/sh.cc	2023-07-10 09:34:33.503284621 +0300
+@@ -664,6 +664,34 @@
+ #undef  TARGET_HAVE_SPECULATION_SAFE_VALUE
+ #define TARGET_HAVE_SPECULATION_SAFE_VALUE speculation_safe_value_not_needed
+ 
++#undef  TARGET_SET_CURRENT_FUNCTION
++#define TARGET_SET_CURRENT_FUNCTION sh_set_current_function
++
++/* Remember the last target of sh_set_current_function.  */
++static GTY (()) tree sh_previous_fndecl;
++
++/* Implement `TARGET_SET_CURRENT_FUNCTION'.  */
++static void
++sh_set_current_function (tree fndecl)
++{
++  if (fndecl == NULL_TREE
++      || fndecl == sh_previous_fndecl
++      || current_function_decl == NULL_TREE
++      || current_function_decl == error_mark_node
++      || ! cfun->machine)
++    return;
++
++  cfun->machine->ashrsi3_libcall_expanded_late = 0;
++  cfun->machine->shad_expanded_late = 0;
++  sh_previous_fndecl = fndecl;
++}
++
++static struct machine_function *
++sh_init_machine_status (void)
++{
++  return ggc_cleared_alloc<machine_function> ();
++}
++
+ struct gcc_target targetm = TARGET_INITIALIZER;
+ 
+ 
+@@ -781,6 +809,14 @@
+ 					    const char* name);
+ extern opt_pass* make_pass_sh_optimize_sett_clrt (gcc::context* ctx,
+ 						  const char* name);
++extern rtl_opt_pass *make_pass_sh_loop2 (gcc::context *ctxt, const char* name);
++extern rtl_opt_pass *make_pass_rtl_sh_loop_init (gcc::context *ctxt,
++						const char* name);
++extern rtl_opt_pass *make_pass_rtl_sh_move_loop_invar (gcc::context *ctxt,
++						       const char* name);
++extern rtl_opt_pass *make_pass_rtl_sh_loop_done (gcc::context *ctxt,
++						const char* name);
++
+ static void
+ register_sh_passes (void)
+ {
+@@ -808,6 +844,18 @@
+      stabilized and won't be changed by further passes.  */
+   register_pass (make_pass_sh_optimize_sett_clrt (g, "sh_optimize_sett_clrt"),
+ 		 PASS_POS_INSERT_BEFORE, "sched2", 1);
++
++  /* Run one more set of loop related  optimization passes, to hoist
++     constant/function address loads out loops, in case they were emitted late,
++     which can happen during/after the combine pass.  */
++  register_pass (make_pass_rtl_sh_loop_done (g, "sh_loop_done1"),
++		 PASS_POS_INSERT_AFTER, "split1", 1);
++  register_pass (make_pass_rtl_sh_move_loop_invar (g, "sh_loop_invariants1"),
++		 PASS_POS_INSERT_AFTER, "split1", 1);
++  register_pass (make_pass_rtl_sh_loop_init (g, "sh_loop_init1"),
++		 PASS_POS_INSERT_AFTER, "split1", 1);
++  register_pass (make_pass_sh_loop2 (g, "sh_loop1"),
++		 PASS_POS_INSERT_AFTER, "split1", 1);
+ }
+ 
+ /* Implement TARGET_OPTION_OVERRIDE macro.  Validate and override 
+@@ -994,6 +1042,9 @@
+     = parse_validate_atomic_model_option (sh_atomic_model_str);
+ 
+   register_sh_passes ();
++
++  /* Set the per-function-data initializer.  */
++  init_machine_status = sh_init_machine_status;
+ }
+ 
+ /* Implement targetm.override_options_after_change.  */
+@@ -3804,15 +3855,10 @@
+       gen_fun (code, ext_ashl_lshr_seq[value].amount[i], operands[0]);
+ }
+ 
+-/* Output RTL for an arithmetic right shift.
+-   ??? Rewrite to use super-optimizer sequences.  */
++/* Output RTL for an arithmetic right shift.  */
+ bool
+ expand_ashiftrt (rtx *operands)
+ {
+-  rtx wrk;
+-  char func[18];
+-  int value;
+-
+   if (TARGET_DYNSHIFT)
+     {
+       if (!CONST_INT_P (operands[2]))
+@@ -3828,13 +3874,19 @@
+ 	  rtx count
+ 	    = force_reg (SImode, GEN_INT (- (INTVAL (operands[2]) & 31)));
+ 	  emit_insn (gen_ashrsi3_d (operands[0], operands[1], count));
++
++	  /* If this is expanded late during split1, might want to run
++	     another loop/cse pass to hoist the constant load out of loops.  */
++	  if (!currently_expanding_to_rtl)
++	    cfun->machine->shad_expanded_late++;
++
+ 	  return true;
+ 	}
+     }
+   if (!CONST_INT_P (operands[2]))
+     return false;
+ 
+-  value = INTVAL (operands[2]) & 31;
++  int value = INTVAL (operands[2]) & 31;
+ 
+   if (value == 31)
+     {
+@@ -3853,7 +3905,7 @@
+     }
+   else if (value >= 16 && value <= 19)
+     {
+-      wrk = gen_reg_rtx (SImode);
++      rtx wrk = gen_reg_rtx (SImode);
+       emit_insn (gen_ashrsi2_16 (wrk, operands[1]));
+       value -= 16;
+       while (value--)
+@@ -3864,23 +3916,14 @@
+   /* Expand a short sequence inline, longer call a magic routine.  */
+   else if (value <= 5)
+     {
+-      wrk = gen_reg_rtx (SImode);
++      rtx wrk = gen_reg_rtx (SImode);
+       emit_move_insn (wrk, operands[1]);
+       while (value--)
+ 	gen_ashift (ASHIFTRT, 1, wrk);
+       emit_move_insn (operands[0], wrk);
+       return true;
+     }
+-
+-  wrk = gen_reg_rtx (Pmode);
+-
+-  /* Load the value into an arg reg and call a helper.  */
+-  emit_move_insn (gen_rtx_REG (SImode, 4), operands[1]);
+-  sprintf (func, "__ashiftrt_r4_%d", value);
+-  rtx lab = function_symbol (wrk, func, SFUNC_STATIC).lab;
+-  emit_insn (gen_ashrsi3_n (GEN_INT (value), wrk, lab));
+-  emit_move_insn (operands[0], gen_rtx_REG (SImode, 4));
+-  return true;
++  return false;
+ }
+ 
+ /* Try to find a good way to implement the combiner pattern
+diff -urN gcc-13.1.0.orig/gcc/config/sh/sh.h gcc-13.1.0/gcc/config/sh/sh.h
+--- gcc-13.1.0.orig/gcc/config/sh/sh.h	2023-04-26 10:09:39.000000000 +0300
++++ gcc-13.1.0/gcc/config/sh/sh.h	2023-07-10 16:48:48.069693133 +0300
+@@ -1874,4 +1874,15 @@
+ 2:\n" TEXT_SECTION_ASM_OP);
+ #endif /* (defined CRT_BEGIN || defined CRT_END) */
+ 
++/* Machine-specific per-function data.
++   This is added to the cfun structure.  */
++struct GTY (()) machine_function
++{
++  /* number of times the ashrsi3 libcall was
++     expanded late during split1 pass.  */
++  unsigned int ashrsi3_libcall_expanded_late;
++
++  /* number of times the shad insn was expanded late during split1 pass.  */
++  unsigned int shad_expanded_late;
++};
+ #endif /* ! GCC_SH_H */
+diff -urN gcc-13.1.0.orig/gcc/config/sh/sh.md gcc-13.1.0/gcc/config/sh/sh.md
+--- gcc-13.1.0.orig/gcc/config/sh/sh.md	2023-04-26 10:09:39.000000000 +0300
++++ gcc-13.1.0/gcc/config/sh/sh.md	2023-07-09 20:46:49.990632643 +0300
+@@ -3778,8 +3778,12 @@
+ {
+   if (expand_ashiftrt (operands))
+     DONE;
+-  else
++
++  if (!CONST_INT_P (operands[2]))
+     FAIL;
++
++  emit_insn (gen_ashrsi3_n_call (operands[0], operands[1], operands[2]));
++  DONE;
+ })
+ 
+ (define_insn "shar"
+@@ -3867,6 +3871,36 @@
+   [(set_attr "type" "sfunc")
+    (set_attr "needs_delay_slot" "yes")])
+ 
++(define_insn_and_split "ashrsi3_n_call"
++  [(set (match_operand:SI 0 "arith_reg_dest")
++	(ashiftrt:SI (match_operand:SI 1 "arith_reg_operand")
++		     (and:SI (match_operand:SI 2 "const_int_operand")
++			     (const_int 31))))
++   (clobber (reg:SI T_REG))]
++  "TARGET_SH1 && can_create_pseudo_p () && operands[2] != const1_rtx"
++  "#"
++  "&& 1"
++  [(const_int 0)]
++{
++  if (expand_ashiftrt (operands))
++    DONE;
++
++  cfun->machine->ashrsi3_libcall_expanded_late++;
++
++  int value = INTVAL (operands[2]) & 31;
++
++  char func[18];
++  sprintf (func, "__ashiftrt_r4_%d", value);
++
++  emit_move_insn (gen_rtx_REG (SImode, 4), operands[1]);
++
++  rtx wrk = gen_reg_rtx (Pmode);
++  rtx lab = function_symbol (wrk, func, SFUNC_STATIC).lab;
++  emit_insn (gen_ashrsi3_n (GEN_INT (value), wrk, lab));
++  emit_move_insn (operands[0], gen_rtx_REG (SImode, 4));
++  DONE;
++})
++
+ ;; . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+ ;; DImode arithmetic shift right
+ 
+diff -urN gcc-13.1.0.orig/gcc/config/sh/sh_loop.cc gcc-13.1.0/gcc/config/sh/sh_loop.cc
+--- gcc-13.1.0.orig/gcc/config/sh/sh_loop.cc	1970-01-01 03:00:00.000000000 +0300
++++ gcc-13.1.0/gcc/config/sh/sh_loop.cc	2023-07-14 10:20:43.031688175 +0300
+@@ -0,0 +1,260 @@
++/* SH specific loop move invariants only optimization.
++   Copyright (C) 2023 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with GCC; see the file COPYING3.  If not see
++<http://www.gnu.org/licenses/>.  */
++
++#include "config.h"
++#include "system.h"
++#include "coretypes.h"
++#include "backend.h"
++#include "target.h"
++#include "rtl.h"
++#include "tree.h"
++#include "cfghooks.h"
++#include "df.h"
++#include "regs.h"
++#include "cfgcleanup.h"
++#include "cfgloop.h"
++#include "tree-pass.h"
++
++/*
++These set of loop optimization passes are essentially copies of the
++generic RTL passes that are ran before the instruction combine pass
++by default.
++
++On SH instruction combination and splitting might produce constant loads
++or function address loads (for libcalls).  These passes are used to hoist
++those late emitted constant loads out of loops.
++*/
++
++namespace
++{
++
++static bool
++optimize_loop (function *fun)
++{
++  return (fun->machine->ashrsi3_libcall_expanded_late > 0
++	  || fun->machine->shad_expanded_late > 0)
++	 && (optimize > 1)
++	 && flag_move_loop_invariants;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++const pass_data pass_data_sh_loop2 =
++{
++  RTL_PASS, // type
++  "", // name
++  OPTGROUP_LOOP, // optinfo_flags
++  TV_LOOP, // tv_id
++  0, // properties_required
++  0, // properties_provided
++  0, // properties_destroyed
++  0, // todo_flags_start
++  0, // todo_flags_finish
++};
++
++class sh_pass_loop2 : public rtl_opt_pass
++{
++public:
++  sh_pass_loop2 (gcc::context *ctxt, const char *name)
++    : rtl_opt_pass (pass_data_sh_loop2, ctxt)
++  {
++    this->name = name;
++  }
++
++  bool gate (function *) final override;
++};
++
++bool
++sh_pass_loop2::gate (function *fun)
++{
++  if (optimize_loop (fun))
++    return true;
++  else
++  {
++    /* No longer preserve loops, remove them now.  */
++    fun->curr_properties &= ~PROP_loops;
++    if (current_loops)
++      loop_optimizer_finalize ();
++    return false;
++  }
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Initialization of the RTL loop passes.
++
++static unsigned int
++rtl_loop_init (void)
++{
++  if (dump_file)
++  {
++    dump_reg_info (dump_file);
++    dump_flow_info (dump_file, dump_flags);
++  }
++  loop_optimizer_init (LOOPS_NORMAL | LOOPS_HAVE_RECORDED_EXITS);
++  return 0;
++}
++
++const pass_data pass_data_rtl_sh_loop_init =
++{
++  RTL_PASS, // type
++  "", // name
++  OPTGROUP_LOOP, // optinfo_flags
++  TV_LOOP, // tv_id
++  0, // properties_required
++  0, // properties_provided
++  0, // properties_destroyed
++  0, // todo_flags_start
++  0, // todo_flags_finish
++};
++
++class pass_rtl_sh_loop_init : public rtl_opt_pass
++{
++public:
++  pass_rtl_sh_loop_init (gcc::context *ctxt, const char* name)
++    : rtl_opt_pass (pass_data_rtl_sh_loop_init, ctxt)
++  {
++    this->name = name;
++  }
++
++  bool gate (function *fun) final override
++  {
++    return optimize_loop (fun);
++  }
++
++  unsigned int execute (function *) final override
++  {
++    return rtl_loop_init ();
++  }
++};
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Finalization of the RTL loop passes.
++
++const pass_data pass_data_rtl_sh_loop_done =
++{
++  RTL_PASS, // type
++  "", // name
++  OPTGROUP_LOOP, // optinfo_flags
++  TV_LOOP, // tv_id
++  0, // properties_required
++  0, // properties_provided
++  PROP_loops, // properties_destroyed
++  0, // todo_flags_start
++  0, // todo_flags_finish
++};
++
++class pass_rtl_sh_loop_done : public rtl_opt_pass
++{
++public:
++  pass_rtl_sh_loop_done (gcc::context *ctxt, const char* name)
++    : rtl_opt_pass (pass_data_rtl_sh_loop_done, ctxt)
++  {
++    this->name = name;
++  }
++
++  bool gate (function *fun) final override
++  {
++    return optimize_loop (fun);
++  }
++
++  unsigned int execute (function *) final override;
++};
++
++unsigned int
++pass_rtl_sh_loop_done::execute (function *fun)
++{
++  /* No longer preserve loops, remove them now.  */
++  fun->curr_properties &= ~PROP_loops;
++  loop_optimizer_finalize ();
++  free_dominance_info (CDI_DOMINATORS);
++  cleanup_cfg (0);
++  if (dump_file)
++  {
++    dump_reg_info (dump_file);
++    dump_flow_info (dump_file, dump_flags);
++  }
++  return 0;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Loop sh_invariant code motion.
++
++const pass_data pass_data_rtl_sh_move_loop_invariants =
++{
++  RTL_PASS, // type
++  "", // name
++  OPTGROUP_LOOP, // optinfo_flags
++  TV_LOOP_MOVE_INVARIANTS, // tv_id
++  0, // properties_required
++  0, // properties_provided
++  0, // properties_destroyed
++  0, // todo_flags_start
++  (TODO_df_verify | TODO_df_finish), // todo_flags_finish
++};
++
++class pass_rtl_sh_move_loop_invariants : public rtl_opt_pass
++{
++public:
++  pass_rtl_sh_move_loop_invariants (gcc::context *ctxt, const char* name)
++    : rtl_opt_pass (pass_data_rtl_sh_move_loop_invariants, ctxt)
++  {
++    this->name = name;
++  }
++  /* opt_pass methods:  */
++  bool gate (function *fun) final override
++  {
++    return optimize_loop (fun);
++  }
++  unsigned int execute (function *fun) final override
++  {
++    if (number_of_loops (fun) > 1)
++      move_loop_invariants ();
++    return 0;
++  }
++};
++
++} // anon namespace
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// This allows instantiating the passes somewhere else without having to pull
++// in a header file.
++
++rtl_opt_pass *
++make_pass_sh_loop2 (gcc::context *ctxt, const char *name)
++{
++  return new sh_pass_loop2 (ctxt, name);
++}
++
++rtl_opt_pass *
++make_pass_rtl_sh_loop_init (gcc::context *ctxt, const char* name)
++{
++  return new pass_rtl_sh_loop_init (ctxt, name);
++}
++
++rtl_opt_pass *
++make_pass_rtl_sh_loop_done (gcc::context *ctxt, const char* name)
++{
++  return new pass_rtl_sh_loop_done (ctxt, name);
++}
++
++rtl_opt_pass *
++make_pass_rtl_sh_move_loop_invar (gcc::context *ctxt, const char* name)
++{
++  return new pass_rtl_sh_move_loop_invariants (ctxt, name);
++}
+diff -urN gcc-13.1.0.orig/gcc/config/sh/t-sh gcc-13.1.0/gcc/config/sh/t-sh
+--- gcc-13.1.0.orig/gcc/config/sh/t-sh	2023-04-26 10:09:39.000000000 +0300
++++ gcc-13.1.0/gcc/config/sh/t-sh	2023-07-09 20:46:49.990632643 +0300
+@@ -33,6 +33,10 @@
+   $(CONFIG_H) $(SYSTEM_H) $(TREE_H) $(TM_H) $(TM_P_H) coretypes.h
+ 	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) $<
+ 
++sh_loop.o: $(srcdir)/config/sh/sh_loop.cc \
++  $(CONFIG_H) $(SYSTEM_H) $(TREE_H) $(TM_H) $(TM_P_H) coretypes.h
++	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) $<
++
+ DEFAULT_ENDIAN = $(word 1,$(TM_ENDIAN_CONFIG))
+ OTHER_ENDIAN = $(word 2,$(TM_ENDIAN_CONFIG))
+ 
+diff -urN gcc-13.1.0.orig/gcc/config.gcc gcc-13.1.0/gcc/config.gcc
+--- gcc-13.1.0.orig/gcc/config.gcc	2023-04-26 10:09:39.000000000 +0300
++++ gcc-13.1.0/gcc/config.gcc	2023-07-10 10:03:50.283042573 +0300
+@@ -561,7 +561,8 @@
+ sh[123456789lbe]*-*-* | sh-*-*)
+ 	cpu_type=sh
+ 	extra_options="${extra_options} fused-madd.opt"
+-	extra_objs="${extra_objs} sh_treg_combine.o sh-mem.o sh_optimize_sett_clrt.o"
++	extra_objs="${extra_objs} sh_treg_combine.o sh-mem.o \
++		    sh_optimize_sett_clrt.o sh_loop.o"
+ 	;;
+ v850*-*-*)
+ 	cpu_type=v850
+diff -urN gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr49263-5.c gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr49263-5.c
+--- gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr49263-5.c	1970-01-01 03:00:00.000000000 +0300
++++ gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr49263-5.c	2023-07-14 10:42:43.241558284 +0300
+@@ -0,0 +1,37 @@
++/* Check that 'tst #64,r0' generated.  */
++/* { dg-do compile }  */
++/* { dg-options "-O2" }  */
++
++/* { dg-final { scan-assembler-times "tst\t#64,r0" 5 { target { ! sh2a } } } }  */
++
++/* { dg-final { scan-assembler-times "bld" 4 { target { sh2a } } } }  */
++/* { dg-final { scan-assembler-times "tst\t#64,r0" 1 { target { sh2a } } } }  */
++
++#define ADDR 0xFFFF0000
++#define P ((unsigned char *)ADDR)
++#define FLAG 64
++
++unsigned char f_tst_signed_char_var_eq (char v)
++{
++  return (v & FLAG) == FLAG;
++}
++
++unsigned char f_tst_unsigned_char_var_eq (unsigned char v)
++{
++  return (v & FLAG) == FLAG;
++}
++
++unsigned char f_tst_unsigned_symbol_eq (void)
++{
++  return (*P & FLAG) == FLAG;
++}
++
++unsigned char f_tst_unsigned_symbol_eq_zero (void)
++{
++  return (*P & FLAG) == 0;
++}
++
++unsigned char f_tst_unsigned_symbol_neq_zero (void)
++{
++  return (*P & FLAG) != 0;
++}
+diff -urN gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr54089-11.c gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr54089-11.c
+--- gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr54089-11.c	1970-01-01 03:00:00.000000000 +0300
++++ gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr54089-11.c	2023-07-14 10:15:17.261719633 +0300
+@@ -0,0 +1,48 @@
++/* Check hoisting.  */
++/* { dg-do compile }  */
++/* { dg-options "-O2" }  */
++
++/* { dg-final { check-function-bodies "**" "" "" } }  */
++
++/*
++**_f_loop1_rshift: { target { ! has_dyn_shift } }
++**	.*
++**	mov\.l	\.L\d+,(r\d+)
++**	.*
++**	sts\.l	pr,@-r15
++**	.*
++**	jsr	@\1
++**	.*
++**	dt	r\d+
++**	bf\.s.*
++*/
++
++/*
++**_f_loop2_rshift: { target { ! has_dyn_shift } }
++**	.*
++**	mov\.l	\.L\d+,(r\d+)
++**	.*
++**	sts\.l	pr,@-r15
++**	.*
++**	jsr	@\1
++**	.*
++**	jsr	@\1
++**	.*
++**	dt	r\d+
++**	bf\.s.*
++*/
++
++void f_loop1_rshift (int* a, unsigned int count)
++{
++  for (int i=0; i<count; i++)
++    a[i] >>= 6;
++}
++
++void f_loop2_rshift (int* a, int* b, unsigned int count)
++{
++  for (int i=0; i<count; i++)
++  {
++    a[i] >>= 6;
++    b[i] >>= 6;
++  }
++}
+diff -urN gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr54089-12.c gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr54089-12.c
+--- gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr54089-12.c	1970-01-01 03:00:00.000000000 +0300
++++ gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr54089-12.c	2023-07-14 10:16:33.511712157 +0300
+@@ -0,0 +1,48 @@
++/* Check expanding ashiftrt to individual shifts after split pass.  */
++/* { dg-do compile }  */
++/* { dg-options "-O2" }  */
++
++/* { dg-final { scan-assembler-not "jsr" { target { has_dyn_shift } } } }  */
++/* { dg-final { scan-assembler-times "___ashiftrt_r4_"   2 { target { ! has_dyn_shift } } } }  */
++/* { dg-final { scan-assembler-times "___ashiftrt_r4_13" 1 { target { ! has_dyn_shift } } } }  */
++/* { dg-final { scan-assembler-times "___ashiftrt_r4_20" 1 { target { ! has_dyn_shift } } } }  */
++
++int f_short_rshift_signed (char v)
++{
++  return v >> 5;
++}
++
++int f_mid1_rshift_signed (char v)
++{
++  return v >> 13;
++}
++
++int f_mid2_rshift_signed (int v)
++{
++  return v >> 17;
++}
++
++int f_long_rshift_signed (int v)
++{
++  return v >> 20;
++}
++
++int f_short_rshift_unsigned (unsigned char v)
++{
++  return v >> 5;
++}
++
++int f_mid1_rshift_unsigned (unsigned char v)
++{
++  return v >> 13;
++}
++
++int f_mid2_rshift_unsigned (unsigned int v)
++{
++  return v >> 17;
++}
++
++int f_long_rshift_unsigned (unsigned int v)
++{
++  return v >> 20;
++}
+\ No newline at end of file
+diff -urN gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr64345-1.c gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr64345-1.c
+--- gcc-13.1.0.orig/gcc/testsuite/gcc.target/sh/pr64345-1.c	2023-04-26 10:09:42.000000000 +0300
++++ gcc-13.1.0/gcc/testsuite/gcc.target/sh/pr64345-1.c	2023-07-07 08:56:41.212345982 +0300
+@@ -5,13 +5,13 @@
+ /* { dg-final { scan-assembler-not "exts|extu|sha|shld|subc|xor" } }  */
+ 
+ /* { dg-final { scan-assembler-times "tst" 716 { target { ! sh2a } } } }  */
+-/* { dg-final { scan-assembler-times "cmp/pz" 6 { target { ! sh2a } } } }  */
++/* { dg-final { scan-assembler-times "cmp/pz" 7 { target { ! sh2a } } } }  */
+ /* { dg-final { scan-assembler-times "shll\t" 6 { target { ! sh2a } } } }  */
+ /* { dg-final { scan-assembler-times "shlr\t" 8 { target { ! sh2a } } } }  */
+ 
+ /* { dg-final { scan-assembler-times "tst" 442 { target { sh2a } } } }  */
+ /* { dg-final { scan-assembler-times "bld" 285 { target { sh2a } } } }  */
+-/* { dg-final { scan-assembler-times "cmp/pz" 6 { target { sh2a } } } }  */
++/* { dg-final { scan-assembler-times "cmp/pz" 7 { target { sh2a } } } }  */
+ /* { dg-final { scan-assembler-times "shll\t" 3 { target { sh2a } } } }  */
+ /* { dg-final { scan-assembler-times "shlr\t" 0 { target { sh2a } } } }  */
+ 
